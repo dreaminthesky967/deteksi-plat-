@@ -1,0 +1,30 @@
+# Dataset (download terpisah dari Roboflow, lihat README)
+dataset/
+train/
+valid/
+test/
+
+# Hasil training YOLO
+runs/
+
+# Model weight (pretrained & hasil training)
+*.pt
+*.pth
+
+# Cache YOLO
+*.cache
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# EasyOCR model cache (kalau ke-download di folder lokal)
+.EasyOCR/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
