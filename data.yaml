@@ -1,4 +1,4 @@
-path: C:/Users/kevin/OneDrive/Documents/Plat nomor kendaraan Indonesia.v2i.yolov8
+path: .
 train: train/images
 val: valid/images
 test: test/images

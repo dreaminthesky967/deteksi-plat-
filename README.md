@@ -1,10 +1,10 @@
 # Sistem Deteksi dan Pengenalan Plat Nomor Kendaraan Indonesia
 
-Sistem deteksi lokasi plat nomor kendaraan menggunakan **YOLOv8** dan pengenalan karakter otomatis menggunakan **EasyOCR**, dijalankan secara real-time melalui kamera (webcam laptop / kamera eksternal).
+Sistem deteksi lokasi plat nomor kendaraan menggunakan **YOLOv8** dan pengenalan karakter otomatis menggunakan **EasyOCR**, dijalankan secara real-time melalui kamera  (webcam laptop / kamera eksternal).
 
 ## Fitur
 
-- Deteksi lokasi plat nomor kendaraan pada video real-time (YOLOv8, transfer learning dari `yolov8n.pt`)
+-   Deteksi lokasi plat nomor kendaraan pada video real-time (YOLOv8, transfer learning dari `yolov8n.pt`)
 - Pembacaan otomatis teks pada plat nomor menggunakan EasyOCR
 - Pemisahan otomatis antara **nomor plat** dan **masa berlaku** (format bulan-tahun, misal `09-27`) yang tercetak pada plat
 - Preprocessing crop plat (grayscale, resize, histogram equalization) untuk meningkatkan akurasi OCR
@@ -25,7 +25,7 @@ Model dilatih selama 50 epoch pada 411 gambar training, dievaluasi pada data val
 ```
 ├── train.py             # Script training YOLOv8
 ├── detect.py            # Deteksi + OCR real-time via kamera
-├── evaluate_test.py     # Evaluasi model pada data test
+├── cek_model.py         # Evaluasi model pada data test
 ├── requirements.txt
 └── data.yaml            # Konfigurasi dataset (path perlu disesuaikan)
 ```
@@ -55,6 +55,8 @@ pip install -r requirements.txt
 
 ## Cara Pakai
 
+pip install torch-directml ( untuk proses pararel di rx)
+
 ### 1. Training model
 
 ```bash
@@ -65,26 +67,21 @@ Model terbaik akan tersimpan di `runs/detect/plate_detector/weights/best.pt`.
 ### 2. Evaluasi pada data test
 
 ```bash
-python evaluate_test.py
+python cek_model.py
 ```
 
-### 3. Deteksi + OCR real-time via kamera
+### 3. Deteksi OCR upload gambar + OCR real-time via kamera
 
 Sesuaikan path model di `detect.py` (`YOLO("path/ke/best.pt")`), lalu jalankan:
 
 ```bash
-python detect.py
+python app.py.py
+```
+
+```
+untuk via web : 
+pip install flask yt-dlp
 ```
 
 Tekan `q` untuk keluar.
 
-## Rencana Pengembangan Selanjutnya
-
-- Dashboard web berbasis Flask untuk menampilkan hasil deteksi secara live
-- Penyimpanan hasil deteksi (nomor plat, masa berlaku, waktu, foto) ke database
-- Logic anti-duplikat/cooldown untuk mencegah pencatatan berulang pada kendaraan yang sama
-- Validasi otomatis status plat kadaluarsa berdasarkan masa berlaku yang terbaca
-
-## Lisensi Dataset
-
-Dataset yang digunakan berlisensi CC BY 4.0, sesuai ketentuan dari pemilik dataset di Roboflow Universe.
