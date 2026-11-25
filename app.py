@@ -15,8 +15,8 @@ from ultralytics import YOLO
 
 BASE = Path(__file__).resolve().parent
 
-
 # KONFIGURASI SISTEM
+
 DEBUG = False               # True: cetak hasil mentah OCR + simpan crop ke folder debug_crops/
 CONF = 0.35                 # confidence deteksi untuk video
 CONF_UPLOAD = 0.25          # confidence deteksi untuk upload
@@ -31,8 +31,8 @@ UPLOAD_MAX_W = 1920
 PAD = 0.10                  # padding crop plat
 MIN_CROP_W = 34             # crop lebih sempit dari 34px pada gambar jauh terlalu buram untuk OCR
 MIN_CROP_H = 14             # tinggi minimum plat agar tidak menghasilkan teks halusinasi
-MIN_SCORE = 0.16            # skor minimum dinaikkan agar plat buram tidak menghasilkan 'T 53 O' / 'D 4 O'
-EARLY_SCORE = 0.62          # batas early-exit dinaikkan agar varian terbaik benar-benar terpilih
+MIN_SCORE = 0.16            # skor minimum kandidat OCR
+EARLY_SCORE = 0.65          # batas early-exit
 OCR_WARMUP_EVERY = 2
 OCR_EVERY = 10
 STABLE_VOTES = 5
@@ -41,11 +41,11 @@ MAX_MISSED = 15
 SKIP = {"webcam": 0, "youtube": 2}
 ALLOW = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-. "
 
-FAST_VARIANTS = ["gray", "clahe", "otsu", "pca"]
-FULL_VARIANTS = ["gray", "clahe", "sharp", "pca", "otsu", "adapt", "invert"]
+FAST_VARIANTS = ["gray", "unsharp", "clahe", "pca"]
+FULL_VARIANTS = ["gray", "unsharp", "clahe", "sharp", "pca", "otsu", "adapt", "invert"]
 
+#  KLASIFIKASI HURUF & ANGKA (CONFUSION MATRIX)
 
-# KLASIFIKASI HURUF & ANGKA 
 CHAR_TO_DIGIT = {
     "O": "0", "Q": "0", "D": "0", "U": "0", "C": "0",
     "I": "1", "L": "1", "J": "1", "|": "1",
@@ -59,7 +59,6 @@ CHAR_TO_DIGIT = {
     "P": "9",
 }
 
-# Pemetaan karakter ke HURUF
 DIGIT_TO_LETTER = {
     "0": "O",
     "1": "I",
@@ -73,7 +72,7 @@ DIGIT_TO_LETTER = {
     "9": "P",
 }
 
-# Kemiripan antar-huruf untuk memperbaiki Kode Wilayah 
+# Kemiripan antar-huruf untuk memperbaiki Kode Wilayah (Prefix)
 LETTER_CONFUSION = {
     "O": "DGBQ",
     "D": "OBG",
@@ -94,11 +93,11 @@ LETTER_CONFUSION = {
     "V": "UW",
     "U": "VW",
     "W": "VU",
-    "M": "N",
-    "N": "M",
+    "M": "NH",
+    "N": "MH",
+    "H": "MN",
 }
 
-# Daftar resmi Kode Wilayah Plat Nomor Indonesia
 PREFIXES = set("""
 A B D E F G H K L M N P R S T W Z
 AA AB AD AE AG BA BB BD BE BG BH BK BL BM BN BP BR
@@ -108,9 +107,8 @@ EA EB ED KB KH KT KU PA PB PG
 
 SPECIAL_RE = re.compile(r"^([0-9OIZSBGLQD]{3,5})\s*[-.]\s*(\d{2}|[IVX]{1,4})$")
 
+# 3. INISIALISASI MODEL
 
-
-#  INISIALISASI MODEL
 weights = next((p for p in [
     BASE / "runs_plat/plate_detector/weights/best.pt",
     BASE / "runs_plat/plate_detector/weights/last.pt"
@@ -129,79 +127,304 @@ def dbg(*args):
     if DEBUG:
         print("[DBG]", *args)
 
+# 4. VERIFIKASI GEOMETRI KARAKTER ('1' vs '7'/'3' dan 'M' vs 'H')
+def _extract_fg_mask(roi_gray: np.ndarray) -> np.ndarray:
+    """
+    Menghasilkan mask biner dengan TINTA = 255 (putih) dan LATAR = 0 (hitam).
+    Otomatis mendeteksi polaritas tepi ROI agar tetap akurat pada varian 'invert'.
+    """
+    _, bw = cv2.threshold(roi_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Cek warna mayoritas di sepanjang garis tepi ROI (latar selalu mendominasi tepi)
+    border = np.concatenate([bw[0, :], bw[-1, :], bw[:, 0], bw[:, -1]])
+    if float((border > 0).mean()) >= 0.5:
+        return 255 - bw  # latar putih -> balik agar tinta menjadi putih (255)
+    return bw
 
 
-# VERIFIKASI GEOMETRI ANGKA '1' VS '7' & '3'
+def _tight_crop(mask: np.ndarray) -> np.ndarray | None:
+    """Memotong mask biner tepat pada batas terluar tinta setelah membuang bintik noise."""
+    if mask.size == 0:
+        return None
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels <= 1:
+        return None
 
-def verify_digit_geometry(gray_img: np.ndarray, items: list[dict]) -> list[dict]:
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    max_area = int(areas.max())
+    cleaned = np.zeros_like(mask)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= max(6, int(0.08 * max_area)):
+            cleaned[labels == i] = 255
+
+    ys, xs = np.where(cleaned > 0)
+    if len(ys) == 0 or len(xs) == 0:
+        return None
+    return cleaned[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+
+
+def _segment_characters(roi_fg: np.ndarray, expected_len: int) -> list[np.ndarray] | None:
+    """
+    Memisahkan karakter di dalam ROI menggunakan connected components yang digabung secara horizontal.
+    Mengembalikan list tight-crop biner jika jumlah segmen cocok dengan expected_len, jika tidak None.
+    """
+    h, w = roi_fg.shape[:2]
+    if h < 12 or w < 6:
+        return None
+
+    if expected_len == 1:
+        tc = _tight_crop(roi_fg)
+        return [tc] if tc is not None else None
+
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(roi_fg, connectivity=8)
+    boxes = []
+    for i in range(1, num_labels):
+        x = int(stats[i, cv2.CC_STAT_LEFT])
+        bh = int(stats[i, cv2.CC_STAT_HEIGHT])
+        bw = int(stats[i, cv2.CC_STAT_WIDTH])
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if bh >= 0.40 * h and area >= 12:
+            boxes.append([x, x + bw])
+
+    if not boxes:
+        return None
+
+    boxes.sort(key=lambda b: b[0])
+    # Gabungkan komponen yang bertumpuk secara horizontal (misalnya karakter patah vertikal)
+    merged = [boxes[0]]
+    for bx1, bx2 in boxes[1:]:
+        px1, px2 = merged[-1]
+        overlap = min(px2, bx2) - max(px1, bx1)
+        min_w = max(1, min(px2 - px1, bx2 - bx1))
+        if overlap > 0.35 * min_w:
+            merged[-1][1] = max(px2, bx2)
+        else:
+            merged.append([bx1, bx2])
+
+    if len(merged) == expected_len:
+        crops = []
+        for bx1, bx2 in merged:
+            tc = _tight_crop(roi_fg[:, max(0, bx1):min(w, bx2)])
+            if tc is None:
+                return None
+            crops.append(tc)
+        return crops
+
+    # Fallback: cari lembah proyeksi vertikal untuk memisahkan karakter yang sedikit bersentuhan
+    col_density = (roi_fg > 0).mean(axis=0)
+    cuts = [0]
+    step = w / expected_len
+    for k in range(1, expected_len):
+        center = int(round(k * step))
+        lo = max(cuts[-1] + 2, int(center - 0.28 * step))
+        hi = min(w - 2, int(center + 0.28 * step))
+        if lo >= hi:
+            return None
+        valley = lo + int(np.argmin(col_density[lo:hi]))
+        # Hanya terima pemotongan jika lembah cukup tipis (< 35% tinggi) agar tidak membelah huruf
+        if col_density[valley] > 0.35:
+            return None
+        cuts.append(valley)
+    cuts.append(w)
+
+    crops = []
+    for i in range(expected_len):
+        tc = _tight_crop(roi_fg[:, cuts[i]:cuts[i + 1]])
+        if tc is None:
+            return None
+        crops.append(tc)
+    return crops
+
+
+def _is_one_not_seven(char_fg: np.ndarray) -> bool:
+    """
+    Membedakan angka '1' asli (yang salah dibaca '7') dari angka '7' asli.
+    - '1' memiliki batang vertikal lurus dari atas ke bawah (max_col_fill tinggi),
+      pusat massa tidak bergeser miring, dan rasio lebar/tinggi sangat ramping.
+    - '7' memiliki atap horizontal lebar di atas dan kaki diagonal miring (com_shift tinggi).
+    """
+    h, w = char_fg.shape[:2]
+    if h < 12 or w < 3:
+        return False
+
+    aspect = w / h
+    fg_bool = char_fg > 0
+
+    # 1. Cek apakah ada batang vertikal lurus kontinu dari atas sampai bawah
+    col_fill = fg_bool.mean(axis=0)
+    max_col_fill = float(col_fill.max())
+
+    # 2. Cek lebar atap pada 20% bagian teratas
+    top_band = fg_bool[:max(2, int(h * 0.20)), :]
+    top_cols = np.where(top_band.any(axis=0))[0]
+    top_span = ((top_cols[-1] - top_cols[0] + 1) / w) if len(top_cols) >= 2 else (1.0 / w)
+
+    # 3. Cek kemiringan stroke (pergeseran pusat massa X dari bagian atas ke bagian bawah)
+    upper_mid = fg_bool[int(h * 0.15):int(h * 0.40), :]
+    lower_mid = fg_bool[int(h * 0.65):int(h * 0.92), :]
+    _, ux = np.where(upper_mid)
+    _, lx = np.where(lower_mid)
+    if len(ux) == 0 or len(lx) == 0:
+        return False
+    com_shift = (float(ux.mean()) - float(lx.mean())) / w  # positif besar pada '7' yang miring
+
+    # Jika miring khas '7' DAN punya atap lebar, PASTI '7' (jangan pernah diubah ke '1')
+    if com_shift > 0.13 and top_span >= 0.72 and max_col_fill < 0.78:
+        return False
+
+    # Syarat ketat agar karakter dikonfirmasi sebagai angka '1':
+    # Sangat ramping (< 0.34) ATAU punya batang lurus vertikal penuh (>= 0.78) tanpa kemiringan '7'
+    if aspect < 0.34 and max_col_fill >= 0.68:
+        return True
+    if aspect < 0.42 and max_col_fill >= 0.80 and abs(com_shift) < 0.12:
+        return True
+
+    return False
+
+
+def _count_horizontal_runs(band: np.ndarray) -> float:
+    """Menghitung median jumlah segmen tinta horizontal pada suatu pita baris."""
+    runs = []
+    for row in band:
+        padded = np.concatenate([[0], row.astype(np.uint8), [0]])
+        transitions = int(np.sum((padded[1:] == 1) & (padded[:-1] == 0)))
+        runs.append(transitions)
+    return float(np.median(runs)) if runs else 0.0
+
+
+def _is_m_not_h(char_fg: np.ndarray) -> bool:
+    """
+    Membedakan huruf 'M' asli (yang salah dibaca 'H') dari huruf 'H' asli.
+    - Pada 'H', bagian dalam atas (y=6..34%) dan bagian dalam bawah (y=72..96%) sama-sama kosong.
+    - Pada 'M', kedua lengan diagonal V mengisi bagian dalam kiri-atas DAN kanan-atas,
+      sementara bagian dalam bawah terbuka kosong.
+    """
+    h, w = char_fg.shape[:2]
+    if h < 14 or w < 10:
+        return False
+
+    fg = char_fg > 0
+    y_u1, y_u2 = int(h * 0.06), int(h * 0.34)
+    y_m1, y_m2 = int(h * 0.40), int(h * 0.62)
+    y_l1, y_l2 = int(h * 0.72), int(h * 0.96)
+
+    x_1, x_mid, x_2 = int(w * 0.24), int(w * 0.50), int(w * 0.76)
+    if y_u2 <= y_u1 or y_l2 <= y_l1 or x_mid <= x_1 or x_2 <= x_mid:
+        return False
+
+    upper_left = float(fg[y_u1:y_u2, x_1:x_mid].mean())
+    upper_right = float(fg[y_u1:y_u2, x_mid:x_2].mean())
+    upper_inner = float(fg[y_u1:y_u2, x_1:x_2].mean())
+    lower_inner = float(fg[y_l1:y_l2, x_1:x_2].mean())
+    mid_inner = float(fg[y_m1:y_m2, x_1:x_2].mean())
+
+    # Hitung jumlah potongan garis horizontal di pita atas (y = 16%..38%)
+    upper_runs = _count_horizontal_runs(fg[int(h * 0.16):int(h * 0.38), :])
+
+    # Fingerprint 1: Terdeteksi jelas 3 atau 4 garis vertikal/diagonal di bagian atas (khas 'M')
+    if upper_runs >= 3.0 and upper_inner >= 0.16 and lower_inner < 0.22:
+        return True
+
+    # Fingerprint 2: Saat agak blur/kecil (kasus B 2905 KIM), lengan V mengisi kedua sisi
+    # bagian dalam atas secara simetris, jauh lebih padat daripada bagian dalam bawah
+    if (
+        upper_left >= 0.14
+        and upper_right >= 0.14
+        and upper_inner >= 0.20
+        and (upper_inner - lower_inner) >= 0.13
+    ):
+        return True
+
+    # Fingerprint 3: Bagian atas jauh lebih penuh daripada bawah & tidak berbentuk palang tipis H murni
+    if upper_inner >= 0.28 and lower_inner < 0.12 and mid_inner < 0.65:
+        return True
+
+    return False
+
+
+def _is_h_not_m(char_fg: np.ndarray) -> bool:
+    """Menjaga agar huruf 'H' yang jelas tidak terbalik menjadi 'M'."""
+    h, w = char_fg.shape[:2]
+    if h < 14 or w < 10:
+        return False
+
+    fg = char_fg > 0
+    upper_inner = float(fg[int(h * 0.05):int(h * 0.30), int(w * 0.26):int(w * 0.74)].mean())
+    mid_inner = float(fg[int(h * 0.40):int(h * 0.62), int(w * 0.26):int(w * 0.74)].mean())
+    lower_inner = float(fg[int(h * 0.72):int(h * 0.96), int(w * 0.26):int(w * 0.74)].mean())
+    upper_runs = _count_horizontal_runs(fg[int(h * 0.12):int(h * 0.30), :])
+
+    return upper_inner < 0.07 and lower_inner < 0.07 and mid_inner > 0.35 and upper_runs <= 2.0
+
+
+def verify_char_geometry(gray_img: np.ndarray, items: list[dict]) -> list[dict]:
+    """
+    Verifikasi geometri pasca-OCR untuk memperbaiki 3 kesalahan tersering pada plat Indonesia:
+    1) Angka '1' tunggal terbaca '3' atau '7' (mis. BP 1 S)
+    2) Angka '1' dalam rangkaian digit terbaca '7' (mis. H 5139 AEC) tanpa merusak '7' asli (BG 5474 QN)
+    3) Huruf 'M' terbaca 'H' (mis. B 2905 KIM) tanpa merusak 'H' asli
+    """
     h_img, w_img = gray_img.shape[:2]
-    _, binary_inv = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
     for it in items:
-        txt = it["txt"].upper()
-        if not any(ch in txt for ch in ("7", "3", "I", "L", "T")):
+        raw_txt = it["txt"].upper()
+        clean_t = re.sub(r"[^A-Z0-9]", "", raw_txt)
+        if not clean_t:
             continue
 
-        x1 = max(0, int(it["x"]))
-        x2 = min(w_img, int(it.get("x2", x1 + it["h"])))
-        y1 = max(0, int(it["yc"] - it["h"] * 0.5))
-        y2 = min(h_img, int(it["yc"] + it["h"] * 0.5))
-        roi = binary_inv[y1:y2, x1:x2]
-        if roi.size == 0 or roi.shape[0] < 10 or roi.shape[1] < 4:
+        needs_digit_check = any(ch in clean_t for ch in ("7", "3", "I", "L", "T"))
+        needs_letter_check = any(ch in clean_t for ch in ("H", "M"))
+        if not needs_digit_check and not needs_letter_check:
             continue
 
-    
-        clean_t = re.sub(r"[^A-Z0-9]", "", txt)
-        if len(clean_t) == 1 and clean_t in ("7", "3", "T", "I", "L"):
-            num_labels, _, stats, _ = cv2.connectedComponentsWithStats(roi, connectivity=8)
-            valid_blobs = [
-                stats[i] for i in range(1, num_labels)
-                if stats[i, cv2.CC_STAT_HEIGHT] >= 0.45 * roi.shape[0]
-            ]
-            if valid_blobs:
-                largest = max(valid_blobs, key=lambda s: s[cv2.CC_STAT_AREA])
-                bw = largest[cv2.CC_STAT_WIDTH]
-                bh = max(1, largest[cv2.CC_STAT_HEIGHT])
-                aspect = bw / bh
-                if aspect < 0.42:
-                    it["txt"] = "1"
-                    continue
+        x1 = max(0, int(it["x"]) - 2)
+        x2 = min(w_img, int(it.get("x2", x1 + it["h"])) + 2)
+        y1 = max(0, int(it["yc"] - it["h"] * 0.55))
+        y2 = min(h_img, int(it["yc"] + it["h"] * 0.55))
+        roi_gray = gray_img[y1:y2, x1:x2]
+        if roi_gray.size == 0 or roi_gray.shape[0] < 12 or roi_gray.shape[1] < 5:
+            continue
 
-        # fiks angka 1 dibaca 7
-        if "7" in txt and len(clean_t) >= 2:
-            col_sum = (roi > 0).mean(axis=0)
-            n_chars = len(txt)
-            char_w = roi.shape[1] / n_chars
-            new_chars = list(txt)
-            for idx, ch in enumerate(new_chars):
-                if ch == "7":
-                    cx1 = max(0, int(idx * char_w))
-                    cx2 = min(roi.shape[1], int((idx + 1) * char_w))
-                    c_roi = roi[:, cx1:cx2]
-                    if c_roi.shape[1] >= 3 and c_roi.shape[0] >= 10:
-                        ch_h, ch_w = c_roi.shape
-                        active_cols = np.where((c_roi > 0).mean(axis=0) > 0.12)[0]
-                        if len(active_cols) >= 2:
-                            eff_w = active_cols[-1] - active_cols[0] + 1
-                            eff_aspect = eff_w / ch_h
-                            top_band = c_roi[:int(ch_h * 0.22), active_cols[0]:active_cols[-1] + 1]
-                            mid_band = c_roi[int(ch_h * 0.35):int(ch_h * 0.75), active_cols[0]:active_cols[-1] + 1]
-                            top_fill = float((top_band > 0).mean()) if top_band.size else 1.0
-                            mid_cols = np.where((mid_band > 0).mean(axis=0) > 0.25)[0]
-                            mid_w = (mid_cols[-1] - mid_cols[0] + 1) if len(mid_cols) >= 2 else eff_w
+        roi_fg = _extract_fg_mask(roi_gray)
+        char_crops = _segment_characters(roi_fg, len(clean_t))
+        if char_crops is None:
+            continue
 
-                            # Ciri mutlak angka '1':
-                            # 1. Rasio lebar efektif sangat ramping (< 0.43), ATAU
-                            # 2. Batang tengahnya tegak lurus sempit (mid_w / ch_h < 0.32) dan lebar atap hampir sama dengan batang
-                            if eff_aspect < 0.43 or (mid_w / ch_h < 0.30 and eff_w <= mid_w * 1.45):
-                                new_chars[idx] = "1"
-                            elif top_fill < 0.48 and (mid_w / ch_h) < 0.36:
-                                new_chars[idx] = "1"
+        # Tentukan apakah token ini dominan angka atau dominan huruf
+        digit_count = sum(c.isdigit() for c in clean_t)
+        is_single_digit_cand = len(clean_t) == 1 and clean_t in ("7", "3", "T", "I", "L")
+        is_digit_token = (digit_count >= len(clean_t) / 2) or is_single_digit_cand
+        is_letter_token = digit_count == 0
+
+        new_chars = list(clean_t)
+        changed = False
+
+        for idx, (ch, c_fg) in enumerate(zip(clean_t, char_crops)):
+            ch_h, ch_w = c_fg.shape[:2]
+            aspect = ch_w / max(1, ch_h)
+
+            # A. Verifikasi Angka '1' vs '7' / '3'
+            if is_digit_token:
+                if len(clean_t) == 1 and ch in ("3", "7", "T", "I", "L"):
+                    if _is_one_not_seven(c_fg) or (ch == "3" and aspect < 0.38):
+                        new_chars[idx] = "1"
+                        changed = True
+                elif ch == "7" and _is_one_not_seven(c_fg):
+                    new_chars[idx] = "1"
+                    changed = True
+
+            # B. Verifikasi Huruf 'M' vs 'H' (hanya pada token huruf: Prefix / Suffix)
+            if is_letter_token:
+                if ch == "H" and _is_m_not_h(c_fg):
+                    new_chars[idx] = "M"
+                    changed = True
+                elif ch == "M" and _is_h_not_m(c_fg):
+                    new_chars[idx] = "H"
+                    changed = True
+
+        if changed:
             it["txt"] = "".join(new_chars)
 
     return items
-
-
 
 # MODUL KLASIFIKASI HURUF & ANGKA SERTA PARSING PLAT
 def classify_character(ch: str, expected_type: str) -> tuple[str, float]:
@@ -286,8 +509,6 @@ def _score_split(s: str, p_len: int, n_len: int) -> tuple[str, float] | None:
 
     cost += pre_cost
 
-    # Penalti anti-halusinasi: jika plat sangat pendek (mis. "D 4 O" atau "T 53 O"),
-    # jangan izinkan ada konversi paksa huruf<->angka (seperti 0->O atau 1->T)
     if total <= 4 and cost > 0.1:
         cost += 1.5
 
@@ -299,7 +520,7 @@ def _score_split(s: str, p_len: int, n_len: int) -> tuple[str, float] | None:
 
 
 def parse_plate(raw: str) -> tuple[str, float] | None:
-   #  Mengurai teks mentah OCR menjadi format standar plat Indonesia [Prefix] [Nomor] [Suffix]
+    """Mengurai teks mentah OCR menjadi format standar plat Indonesia [Prefix] [Nomor] [Suffix]."""
     tokens = re.findall(r"[A-Z0-9]+", raw.upper())
     if not tokens:
         return None
@@ -313,17 +534,14 @@ def parse_plate(raw: str) -> tuple[str, float] | None:
             if best is None or total_cost < best[1]:
                 best = (res[0], total_cost)
 
-    # Jika OCR sudah memisahkan menjadi 3 kelompok (Prefix | Angka | Suffix) = sangat dipercaya
     for i in range(len(tokens) - 2):
         a, b, c = tokens[i], tokens[i + 1], tokens[i + 2]
         consider(_score_split(a + b + c, len(a), len(b)), 0.5 * (len(tokens) - 3) - 0.9)
 
-    # Jika OCR memisahkan menjadi 2 kelompok
     for i in range(len(tokens) - 1):
         a, b = tokens[i], tokens[i + 1]
         consider(_score_split(a + b, len(a), len(b)), 0.5 * (len(tokens) - 2) - 0.2)
 
-    # Uji kombinasi pemotongan string gabungan
     joined = "".join(tokens)
     max_trim = min(2, max(0, len(joined) - 3))
     for trim_left in range(max_trim + 1):
@@ -341,7 +559,7 @@ def parse_plate(raw: str) -> tuple[str, float] | None:
 
 
 def parse_special(raw: str) -> str | None:
-    """Mendeteksi plat dinas"""
+    """Mendeteksi plat dinas/khusus."""
     cleaned = re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9\-. ]", "", raw.upper())).strip()
     m = SPECIAL_RE.match(cleaned)
     if m:
@@ -355,17 +573,12 @@ def parse_special(raw: str) -> str | None:
 
 
 def parse_expiry(raw: str) -> str | None:
-    """
-    Klasifikasi khusus angka untuk membaca masa berlaku plat (MM-YY, contoh: 04-27 atau 08 22).
-    Mendukung pemisah strip, titik, spasi, maupun 4 digit rapat.
-    """
+    """Membaca masa berlaku plat (MM-YY) dengan toleransi pemisah spasi/titik/strip."""
     converted = "".join(CHAR_TO_DIGIT.get(c, c) if c.isalpha() else c for c in raw.upper())
-    # Cari pasangan 2 digit bulan dan 2 digit tahun (mis. "08 22", "04-27", "04.27", "0427")
     for m in re.finditer(r"(?<!\d)(\d{2})\s*[-./ ]?\s*(\d{2})(?!\d)", converted):
         mm, yy = int(m.group(1)), int(m.group(2))
         if 1 <= mm <= 12 and 20 <= yy <= 35:
             return f"{mm:02d}-{yy:02d}"
-    # Fallback jika ada 1 karakter noise di tengah (mis. "04 8 27" akibat baut tengah)
     m_bolt = re.search(r"(\d{2})\s*[^0-9A-Z]?\s*[0-9A-Z]\s*[^0-9A-Z]?\s*(\d{2})", converted)
     if m_bolt:
         mm, yy = int(m_bolt.group(1)), int(m_bolt.group(2))
@@ -380,7 +593,6 @@ def no_digit_text(raw: str) -> bool:
 
 
 def group_lines(res) -> list[list[dict]]:
-    """Mengelompokkan bounding box hasil OCR menjadi baris-baris teks dari atas ke bawah."""
     items = []
     for box, txt, conf in res:
         ys = [pt[1] for pt in box]
@@ -410,7 +622,6 @@ def group_lines(res) -> list[list[dict]]:
 
 
 def split_expiry(lines: list[list[dict]]) -> tuple[str | None, list[list[dict]]]:
-    """Memisahkan baris masa berlaku di bagian bawah plat dari baris nomor plat utama."""
     if len(lines) < 2:
         return None, lines
 
@@ -430,11 +641,8 @@ def split_expiry(lines: list[list[dict]]) -> tuple[str | None, list[list[dict]]]
 
     return None, lines
 
-
-
-# PRA-PEMROSESAN CITRA, DESKEWING & OCR
+# 6. PRA-PEMROSESAN CITRA, DESKEWING & OCR
 def deskew_crop(crop: np.ndarray) -> np.ndarray:
-    """Meluruskan crop plat nomor yang miring berdasarkan orientasi garis horizontal."""
     h, w = crop.shape[:2]
     if w < 45 or h < 16:
         return crop
@@ -463,7 +671,6 @@ def deskew_crop(crop: np.ndarray) -> np.ndarray:
 
 
 def normalize_polarity(gray: np.ndarray) -> np.ndarray:
-    """Menormalkan polaritas plat agar selalu berlatar terang dan berteks gelap."""
     h, w = gray.shape
     roi = gray[int(h * 0.20):int(h * 0.80), int(w * 0.08):int(w * 0.92)]
     if roi.size == 0:
@@ -474,7 +681,6 @@ def normalize_polarity(gray: np.ndarray) -> np.ndarray:
 
 
 def pca_gray(crop: np.ndarray) -> np.ndarray:
-    """Proyeksi warna Lab menggunakan PCA untuk memaksimalkan kontras plat berwarna."""
     lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(np.float32)
     lab -= lab.mean(axis=0)
     _, vecs = np.linalg.eigh(np.cov(lab.T) + 1e-6 * np.eye(3))
@@ -485,26 +691,29 @@ def pca_gray(crop: np.ndarray) -> np.ndarray:
 
 
 def generate_variants(crop: np.ndarray, names: list[str]):
-    """Generator berbagai varian kontras/binarisasi untuk membantu EasyOCR."""
+    """Generator varian citra termasuk 'unsharp' tanpa blur agar celah huruf M/W/B tetap tajam."""
     rectified = deskew_crop(crop)
     h = rectified.shape[0]
-    # Perbesar ke tinggi ~160px agar angka masa berlaku ('08 22') di bagian bawah terbaca jelas
-    scale = float(np.clip(165.0 / max(h, 1), 1.0, 6.0))
+    scale = float(np.clip(170.0 / max(h, 1), 1.0, 6.0))
     resize_fn = lambda im: cv2.resize(im, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
     pad_fn = lambda im: cv2.copyMakeBorder(im, 14, 14, 16, 16, cv2.BORDER_CONSTANT, value=255)
 
     raw_gray = resize_fn(cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY))
     base_gray = normalize_polarity(raw_gray)
-    smooth = cv2.bilateralFilter(base_gray, 7, 45, 45)
+    # Penajaman langsung tanpa bilateral blur agar lekukan V di dalam huruf 'M' tidak menyatu
+    unsharp_img = cv2.addWeighted(base_gray, 1.9, cv2.GaussianBlur(base_gray, (0, 0), 2.0), -0.9, 0)
+    smooth = cv2.bilateralFilter(base_gray, 5, 35, 35)
     clahe_img = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(smooth)
 
     for name in names:
         if name == "gray":
             img = base_gray
+        elif name == "unsharp":
+            img = unsharp_img
         elif name == "clahe":
             img = clahe_img
         elif name == "sharp":
-            blur = cv2.GaussianBlur(clahe_img, (0, 0), 3)
+            blur = cv2.GaussianBlur(clahe_img, (0, 0), 2.5)
             img = cv2.addWeighted(clahe_img, 1.7, blur, -0.7, 0)
         elif name == "pca":
             img = normalize_polarity(resize_fn(pca_gray(rectified)))
@@ -522,7 +731,7 @@ def generate_variants(crop: np.ndarray, names: list[str]):
 
 
 def read_plate(crop: np.ndarray, fast: bool = False) -> tuple[str | None, str | None, float, str]:
-    """Menjalankan OCR multi-varian pada satu crop plat beserta verifikasi geometri angka."""
+    """Menjalankan OCR multi-varian pada satu crop plat beserta verifikasi geometri karakter."""
     ch_crop, cw_crop = crop.shape[:2]
     if cw_crop < MIN_CROP_W or ch_crop < MIN_CROP_H:
         return None, None, 0.0, ""
@@ -554,16 +763,11 @@ def read_plate(crop: np.ndarray, fast: bool = False) -> tuple[str | None, str | 
         if not lines:
             continue
 
-        # Pisahkan baris masa berlaku SEBELUM memfilter tinggi karakter utama
         expiry, main_lines = split_expiry(lines)
 
-        # Jika belum ketemu di baris terpisah, pindai kotak-kotak kecil di 35% bagian bawah gambar
         if expiry is None:
             img_h = img.shape[0]
-            bottom_items = [
-                it for l in lines for it in l
-                if it["yc"] > img_h * 0.62
-            ]
+            bottom_items = [it for l in lines for it in l if it["yc"] > img_h * 0.62]
             if bottom_items:
                 bottom_txt = " ".join(it["txt"] for it in sorted(bottom_items, key=lambda x: x["x"]))
                 exp_cand = parse_expiry(bottom_txt)
@@ -574,12 +778,11 @@ def read_plate(crop: np.ndarray, fast: bool = False) -> tuple[str | None, str | 
         if not items:
             continue
 
-        # Saring noise baut kecil pada baris utama
         max_h = max(it["h"] for it in items)
         items = [it for it in items if it["h"] >= 0.42 * max_h]
 
-        # Verifikasi Geometri khusus untuk memperbaiki '7'/'3' palsu kembali menjadi '1'
-        items = verify_digit_geometry(img, items)
+        # Verifikasi geometri presisi untuk '1' vs '7'/'3' dan 'M' vs 'H'
+        items = verify_char_geometry(img, items)
 
         main_txt = " ".join(it["txt"] for it in items)
         raw_texts.append(main_txt)
@@ -607,7 +810,6 @@ def read_plate(crop: np.ndarray, fast: bool = False) -> tuple[str | None, str | 
         mean_conf = float(np.mean([it["conf"] for it in items]))
         score = mean_conf * float(np.exp(-0.70 * max(parsed[1], 0.0)))
 
-        # Tolak halusinasi pada crop plat yang sangat kecil/jauh 
         clean_len = len(re.sub(r"\s+", "", parsed[0]))
         if (cw_crop < 55 or ch_crop < 22) and (clean_len <= 4 or score < 0.38):
             continue
@@ -642,7 +844,6 @@ def read_plate(crop: np.ndarray, fast: bool = False) -> tuple[str | None, str | 
     return best_plate, best_expiry, best_score, raw_combined
 
 # GEOMETRI, NMS & MULTI-OBJECT TRACKER
-
 def _inter(a, b) -> float:
     return max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(0, min(a[3], b[3]) - max(a[1], b[1]))
 
@@ -742,7 +943,7 @@ class PlateTracker:
         self.tracks = [t for t in self.tracks if t.missed <= MAX_MISSED]
         return active_tracks
 
-# PIPELINE DETEKSI YOLO & ANOTASI FRAME
+# 8. PIPELINE DETEKSI YOLO & ANOTASI FRAME
 def _starts(size: int, tile: int, step: int) -> list[int]:
     return [0] if size <= tile else list(range(0, size - tile, step)) + [size - tile]
 
@@ -795,7 +996,6 @@ def detect(frame: np.ndarray, tiled: bool = False) -> list[list[float]]:
 
 
 def annotate(frame: np.ndarray, tracker: PlateTracker, force_ocr: bool = False, tiled: bool = False):
-    """Mendeteksi plat, menjalankan OCR, menggambar bounding box, dan mengembalikan hasil bersih."""
     h, w = frame.shape[:2]
     with infer_lock:
         dets = detect(frame, tiled=tiled)
@@ -820,8 +1020,6 @@ def annotate(frame: np.ndarray, tracker: PlateTracker, force_ocr: bool = False, 
 
     results = []
     for t, (x1, y1, x2, y2), conf in zip(tracks, boxes, confs):
-        # Pada mode upload (force_ocr=True), jangan tampilkan box yang gagal terbaca OCR
-        # agar tidak muncul kotak '?' atau 'plat 0.83' tanpa nomor di UI
         if t.rejected or (force_ocr and not t.plate) or (not t.plate and conf < CONF_WEAK):
             continue
 
@@ -843,7 +1041,7 @@ def annotate(frame: np.ndarray, tracker: PlateTracker, force_ocr: bool = False, 
     results.sort(key=lambda r: r["x"])
     return frame, results
 
-#  WORKER STREAMING & SERVER FLASK
+# WORKER STREAMING & SERVER FLASK
 state = {
     "jpg": None, "seq": 0, "plates": [], "plate": "", "expiry": None,
     "fps": 0.0, "msg": "Pilih sumber lalu klik Mulai"
